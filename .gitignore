@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+venv/
+.env
+
+# Large processed data
+data/processed/*.npy
+data/processed/*.bin
+data/processed/*.pkl
+data/processed/*.parquet
+
+# VSCode
+.vscode/
+
+# OS
+.DS_Store
