@@ -13,6 +13,9 @@ data/processed/*.bin
 data/processed/*.pkl
 data/processed/*.parquet
 
+# Raw datasets
+data/raw/
+
 # VSCode
 .vscode/
 
