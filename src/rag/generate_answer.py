@@ -8,6 +8,8 @@ def generate_answer(prompt):
         "prompt": prompt,
         "stream": False
     }
-
+    options={
+    "num_predict": 200
+}
     response = requests.post(url, json=payload)
     return response.json()["response"]

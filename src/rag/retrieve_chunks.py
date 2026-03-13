@@ -1,26 +1,40 @@
+import os
 import faiss
 import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
-
-print("Loading embedding model...")
-model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-
-print("Loading FAISS index...")
-index = faiss.read_index("data/processed/faiss_index.bin")
-
-print("Loading chunk metadata...")
-chunks_df = pd.read_parquet("data/processed/chunks.parquet")
-
-print("System ready!")
+import streamlit as st
 
 
-def retrieve_top_chunks(query, top_k=5):
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+FAISS_PATH = os.path.join(BASE_DIR, "data", "processed", "faiss_index.bin")
+CHUNKS_PATH = os.path.join(BASE_DIR, "data", "processed", "chunks.csv")
 
-    # Convert query to embedding
+
+@st.cache_resource
+def load_retrieval_system():
+
+    print("Loading embedding model...")
+    model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+    print("Loading FAISS index...")
+    index = faiss.read_index(FAISS_PATH)
+
+    print("Loading metadata...")
+    chunks_df = pd.read_csv(CHUNKS_PATH)
+
+    print("System Ready!")
+
+    return model, index, chunks_df
+
+
+model, index, chunks_df = load_retrieval_system()
+
+
+def retrieve_top_chunks(query, top_k=3):
+
     query_embedding = model.encode([query])
 
-    # Search FAISS
     distances, indices = index.search(np.array(query_embedding), top_k)
 
     results = []
@@ -30,23 +44,9 @@ def retrieve_top_chunks(query, top_k=5):
 
         results.append({
             "ticker": row["ticker"],
+            "year": row["year"],
             "quarter": row["quarter"],
             "text": row["chunk_text"]
         })
 
     return results
-
-
-if __name__ == "__main__":
-
-    query = "AI investment strategy and machine learning infrastructure"
-
-    results = retrieve_top_chunks(query)
-
-    print("\nTop Results:\n")
-
-    for r in results:
-        print("Ticker:", r["ticker"])
-        print("Quarter:", r["quarter"])
-        print(r["text"])
-        print("\n--------------------------\n")
