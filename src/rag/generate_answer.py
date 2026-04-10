@@ -4,7 +4,7 @@ def generate_answer(prompt):
     url = "http://localhost:11434/api/generate"
 
     payload = {
-        "model": "llama3",
+        "model": "llama3.2",
         "prompt": prompt,
         "stream": False
     }
