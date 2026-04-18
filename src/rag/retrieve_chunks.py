@@ -1,4 +1,5 @@
 import os
+import re
 import faiss
 import numpy as np
 import pandas as pd
@@ -9,7 +10,29 @@ import streamlit as st
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 FAISS_PATH = os.path.join(BASE_DIR, "data", "processed", "faiss_index.bin")
-CHUNKS_PATH = os.path.join(BASE_DIR, "data", "processed", "chunks.csv")
+CHUNKS_PATH = os.path.join(BASE_DIR, "data", "processed", "chunks.parquet")
+
+# ============================================
+# FILTERING CONSTANTS
+# ============================================
+
+MIN_RELEVANCE_THRESHOLD = 0.62
+MAX_CHUNKS_PER_TICKER = 2
+
+# Ticker aliases — maps company name mentions to ticker symbols
+TICKER_ALIASES = {
+    "amazon": "AMZN", "aws": "AMZN",
+    "apple": "AAPL", "iphone": "AAPL",
+    "microsoft": "MSFT", "azure": "MSFT",
+    "google": "GOOGL", "alphabet": "GOOGL",
+    "meta": "META", "facebook": "META",
+    "netflix": "NFLX",
+    "nvidia": "NVDA",
+    "tesla": "TSLA",
+    "salesforce": "CRM",
+    "oracle": "ORCL",
+    "intel": "INTC",
+}
 
 
 # ============================================
@@ -18,6 +41,7 @@ CHUNKS_PATH = os.path.join(BASE_DIR, "data", "processed", "chunks.csv")
 
 @st.cache_resource
 def load_retrieval_resources():
+    print("⚠️ LOADING RESOURCES — this should only print ONCE")
 
     print("Loading embedding model...")
     model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
@@ -27,7 +51,7 @@ def load_retrieval_resources():
     index.nprobe = 10
 
     print("Loading metadata...")
-    chunks_df = pd.read_csv(CHUNKS_PATH)
+    chunks_df = pd.read_parquet(CHUNKS_PATH)
 
     print("Retrieval system ready.")
     return model, index, chunks_df
@@ -51,26 +75,72 @@ def encode_query(query: str) -> np.ndarray:
 
 
 # ============================================
+# METADATA EXTRACTION
+# ============================================
+
+def extract_years(query: str) -> list[int]:
+    """Extract year mentions from query e.g. '2022' -> [2022]"""
+    return [int(y) for y in re.findall(r'\b(20\d{2})\b', query)]
+
+
+def extract_ticker(query: str) -> str | None:
+    """Extract ticker from query via alias map."""
+    q = query.lower()
+    for alias, ticker in TICKER_ALIASES.items():
+        if alias in q:
+            return ticker
+    # Also check if an actual ticker is mentioned e.g. "AMZN"
+    tickers = re.findall(r'\b([A-Z]{2,5})\b', query)
+    for t in tickers:
+        if t in chunks_df["ticker"].values:
+            return t
+    return None
+
+
+# ============================================
 # RETRIEVAL
 # ============================================
 
 def retrieve_top_chunks(query: str, top_k: int = 5) -> list[dict]:
-    """Retrieve top_k most relevant prepared-section chunks for a query.
+    """Retrieve top_k most relevant chunks for a query.
 
-    Each result includes a relevance_score (0-1) which is the cosine
-    similarity between the query embedding and the chunk embedding.
-    Since both are L2-normalized, the FAISS inner product distance
-    IS the cosine similarity — no extra computation needed.
+    Applies staged filtering:
+    Stage 1 - Metadata pre-filter (year + ticker from query)
+    Stage 2 - FAISS vector search on filtered subset
+    Stage 3 - Post-filter (boilerplate, relevance threshold, diversity)
     """
 
     query_embedding = encode_query(query)
-    fetch_k = top_k * 5
+    fetch_k = top_k * 10
 
-    # distances = inner product = cosine similarity (since normalized)
+    # ── Stage 1: Metadata pre-filter ──────────────────────────────────────
+    filtered_df = chunks_df.copy()
+
+    years = extract_years(query)
+    if years:
+        filtered_df = filtered_df[filtered_df["year"].isin(years)]
+
+    ticker = extract_ticker(query)
+    if ticker:
+        ticker_df = filtered_df[filtered_df["ticker"] == ticker]
+        # Only apply ticker filter if it returns enough chunks
+        if len(ticker_df) >= top_k * 2:
+            filtered_df = ticker_df
+
+    # Fall back to full dataset if pre-filter is too aggressive
+    if len(filtered_df) < top_k * 2:
+        filtered_df = chunks_df.copy()
+
+    # ── Stage 2: FAISS search on filtered subset ───────────────────────────
+    # Get indices of filtered rows to map FAISS results back
+    filtered_indices = filtered_df.index.tolist()
+
     distances, indices = index.search(np.array(query_embedding), fetch_k)
 
+    # ── Stage 3: Post-filter ───────────────────────────────────────────────
     results = []
     seen = set()
+    ticker_counts = {}
 
     skip_phrases = [
         "without limitation",
@@ -80,10 +150,30 @@ def retrieve_top_chunks(query: str, top_k: int = 5) -> list[dict]:
         "please refer to",
         "form 10-k",
         "form 10-q",
+        "— analyst",
+        "— operator",
+        "thank you. operator",
+        "our next question comes",
+        "cowen and company",
+        "bank of america",
+        "goldman sachs",
+        "morgan stanley",
+        "jp morgan",
+        "oppenheimer",
+        "jefferies",
+        "citigroup",
+        "barclays",
     ]
 
     for idx, score in zip(indices[0], distances[0]):
         if idx == -1:
+            continue
+
+        # Only include chunks that passed the pre-filter
+        if idx not in filtered_indices:
+            continue
+
+        if score < MIN_RELEVANCE_THRESHOLD:
             continue
 
         row = chunks_df.iloc[idx]
@@ -100,14 +190,17 @@ def retrieve_top_chunks(query: str, top_k: int = 5) -> list[dict]:
             continue
         seen.add(key)
 
+        ticker_val = row["ticker"]
+        ticker_counts[ticker_val] = ticker_counts.get(ticker_val, 0)
+        if ticker_counts[ticker_val] >= MAX_CHUNKS_PER_TICKER:
+            continue
+        ticker_counts[ticker_val] += 1
+
         results.append({
-            "ticker": row["ticker"],
+            "ticker": ticker_val,
             "year": row["year"],
             "quarter": row["quarter"],
             "text": row["chunk_text"],
-            # Cosine similarity between query and chunk (0 to 1).
-            # Clipped to [0,1] since inner product on normalized vectors
-            # can occasionally return tiny negative values.
             "relevance_score": round(float(np.clip(score, 0, 1)), 3)
         })
 
