@@ -3,7 +3,7 @@ import re
 import faiss
 import numpy as np
 import pandas as pd
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from functools import lru_cache
 import streamlit as st
 
@@ -16,7 +16,7 @@ CHUNKS_PATH = os.path.join(BASE_DIR, "data", "processed", "chunks.parquet")
 # FILTERING CONSTANTS
 # ============================================
 
-MIN_RELEVANCE_THRESHOLD = 0.62
+MIN_RELEVANCE_THRESHOLD = 0.50
 MAX_CHUNKS_PER_TICKER = 2
 
 # Ticker aliases — maps company name mentions to ticker symbols
@@ -44,7 +44,10 @@ def load_retrieval_resources():
     print("⚠️ LOADING RESOURCES — this should only print ONCE")
 
     print("Loading embedding model...")
-    model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    model = SentenceTransformer("BAAI/bge-small-en-v1.5")
+
+    print("Loading cross-encoder reranker...")
+    reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", max_length=512)
 
     print("Loading FAISS index...")
     index = faiss.read_index(FAISS_PATH)
@@ -54,10 +57,10 @@ def load_retrieval_resources():
     chunks_df = pd.read_parquet(CHUNKS_PATH)
 
     print("Retrieval system ready.")
-    return model, index, chunks_df
+    return model, reranker, index, chunks_df
 
 
-model, index, chunks_df = load_retrieval_resources()
+model, reranker, index, chunks_df = load_retrieval_resources()
 
 
 # ============================================
@@ -89,7 +92,6 @@ def extract_ticker(query: str) -> str | None:
     for alias, ticker in TICKER_ALIASES.items():
         if alias in q:
             return ticker
-    # Also check if an actual ticker is mentioned e.g. "AMZN"
     tickers = re.findall(r'\b([A-Z]{2,5})\b', query)
     for t in tickers:
         if t in chunks_df["ticker"].values:
@@ -108,6 +110,7 @@ def retrieve_top_chunks(query: str, top_k: int = 5) -> list[dict]:
     Stage 1 - Metadata pre-filter (year + ticker from query)
     Stage 2 - FAISS vector search on filtered subset
     Stage 3 - Post-filter (boilerplate, relevance threshold, diversity)
+    Stage 4 - Cross-encoder reranking on top-25 candidates
     """
 
     query_embedding = encode_query(query)
@@ -123,22 +126,18 @@ def retrieve_top_chunks(query: str, top_k: int = 5) -> list[dict]:
     ticker = extract_ticker(query)
     if ticker:
         ticker_df = filtered_df[filtered_df["ticker"] == ticker]
-        # Only apply ticker filter if it returns enough chunks
         if len(ticker_df) >= top_k * 2:
             filtered_df = ticker_df
 
-    # Fall back to full dataset if pre-filter is too aggressive
     if len(filtered_df) < top_k * 2:
         filtered_df = chunks_df.copy()
 
-    # ── Stage 2: FAISS search on filtered subset ───────────────────────────
-    # Get indices of filtered rows to map FAISS results back
+    # ── Stage 2: FAISS search ──────────────────────────────────────────────
     filtered_indices = filtered_df.index.tolist()
-
     distances, indices = index.search(np.array(query_embedding), fetch_k)
 
     # ── Stage 3: Post-filter ───────────────────────────────────────────────
-    results = []
+    candidates = []
     seen = set()
     ticker_counts = {}
 
@@ -169,7 +168,6 @@ def retrieve_top_chunks(query: str, top_k: int = 5) -> list[dict]:
         if idx == -1:
             continue
 
-        # Only include chunks that passed the pre-filter
         if idx not in filtered_indices:
             continue
 
@@ -196,15 +194,35 @@ def retrieve_top_chunks(query: str, top_k: int = 5) -> list[dict]:
             continue
         ticker_counts[ticker_val] += 1
 
-        results.append({
+        candidates.append({
             "ticker": ticker_val,
             "year": row["year"],
             "quarter": row["quarter"],
             "text": row["chunk_text"],
-            "relevance_score": round(float(np.clip(score, 0, 1)), 3)
+            "faiss_score": round(float(np.clip(score, 0, 1)), 3)
         })
 
-        if len(results) >= top_k:
+        if len(candidates) >= top_k * 5:  # collect up to 25 for reranking
             break
 
-    return results
+    # ── Stage 4: Cross-encoder reranking ──────────────────────────────────
+    if candidates:
+        pairs = [[query, c["text"]] for c in candidates]
+        rerank_scores = reranker.predict(pairs)
+
+        for i, c in enumerate(candidates):
+            c["relevance_score"] = round(float(rerank_scores[i]), 3)
+
+        # Sort by reranker score descending
+        candidates.sort(key=lambda x: x["relevance_score"], reverse=True)
+
+        # Normalize reranker scores to 0-1 range for display
+        scores = [c["relevance_score"] for c in candidates]
+        min_s, max_s = min(scores), max(scores)
+        for c in candidates:
+            if max_s > min_s:
+                c["relevance_score"] = round((c["relevance_score"] - min_s) / (max_s - min_s), 3)
+            else:
+                c["relevance_score"] = 1.0
+
+    return candidates[:top_k]
